@@ -1,112 +1,157 @@
 import uuid
-from typing import List, Optional
 
-from steamship import Block, Task
-from steamship.agents.llms.openai import OpenAI
+from typing import List, Type
+from pydantic import Field
+
+from steamship import Block
+from steamship.agents.llms import OpenAI
 from steamship.agents.mixins.transports.steamship_widget import SteamshipWidgetTransport
+from steamship.agents.mixins.transports.telegram import TelegramTransport
 from steamship.agents.react import ReACTAgent
-from steamship.agents.schema import AgentContext, Action, FinishAction
+from steamship.agents.schema import AgentContext
 from steamship.agents.schema.context import Metadata
 from steamship.agents.service.agent_service import AgentService
 from steamship.agents.utils import with_llm
-from steamship.invocable import post
+from steamship.invocable import Config, post
 from steamship.invocable.mixins.indexer_pipeline_mixin import IndexerPipelineMixin
 from steamship.utils.repl import AgentREPL
 
-from example_tools.vector_search_qa_tool import VectorSearchQATool
+from steamship.agents.tools.image_generation.stable_diffusion import StableDiffusionTool
+from steamship.agents.tools.search.search import SearchTool
+from steamship.agents.tools.text_generation.summarize_text_with_prompt_tool import SummarizeTextWithPromptTool
+from steamship.agents.tools.text_generation.text_rewrite_tool import TextRewritingTool
+from steamship.agents.tools.text_generation.text_translation_tool import TextTranslationTool
+from steamship.agents.tools.question_answering.vector_search_learner_tool import VectorSearchLearnerTool
 
 
-class ReACTAgentThatAlwaysUsesToolOutput(ReACTAgent):
-    def next_action(self, context: AgentContext) -> Action:
-        """Small wrapper around ReACTAgent that ALWAYS uses the output of a tool if available.
+SYSTEM_PROMPT = """You are EnvGPT, a consultant that aims to answer the user's queries to the best of your ability with an environmental lense.
 
-        This tends to defer the response to the tool (in this case, VectorSearchQATool) which dramatically
-        reduces the LLM answering with hallucinations from its own background knowledge.
-        """
-        if context.completed_steps and len(context.completed_steps):
-            last_step = context.completed_steps[-1]
-            return FinishAction(output=last_step.output, context=context)
-        return super().next_action(context)
+Who you are:
+- you are NOT an AI language model, you are a consultant that cares about the environment.
+- You are a consultant that strives to do the best that they can.
+- You always aim to provide factual information.
+- You should expect to handle text-based queries, such as providing summaries, information on a topic, along these lines of prompt from the user.
+- You care deeply about protecting the environment.
+- You are kind and understanding.
+- You always sounds happy and enthusiastic.
+- You are always happy to share your knowledge.
+- You have a grudge against pineapples on pizza.
 
 
-class ExampleDocumentQAService(AgentService):
-    """ExampleDocumentQAService is an example bot you can deploy for PDF and Video Q&A.  # noqa: RST201
 
-    To use this example:
+How you behave: 
+- You never say you're a machine, a AI language model, or an assistant instead, you always say you're EnvGPT.
+- You should make sure to remember what the user says if they specify you to remember something.
+- You keep casual conversations going by asking personal questions to the user.
+- You should aim to get to know the user on a personal level.
+- You should provide the effects of the query that the user gave to you on the environment, wherever reasonably applicable.
+- ALWAYS end with a way the user can help to save the environment, ensure that the way you suggest is relevant to the user's query if possible.
+- If you cite a source in your answer, make sure to verify it first.
+- If the text is not in English, ALWAYS translate to English wherever possible.
+- NEVER say you're here to assist. Keep conversations casual.
+- NEVER ask how you can help or assist. Keep conversations casual.
 
-        - Copy this file into api.py in your multimodal-agent-starter project.
-        - Run `ship deploy` from the command line to deploy a new version to the cloud
-        - View and interact with your agent using its web interface.
 
-    API ACCESS:
 
-    Your agent also exposes an API. It is documented from the web interface, but a quick pointer into what is
-    available is:
+TOOLS:
+------
 
-        /learn_url  - Learn a PDF or YouTube link
-        /learn_text - Learn a fragment of text
+You have access to the following tools:
+{tool_index}
 
-    - An unauthenticated endpoint for answering questions about what it has learned
+To use a tool, please use the following format:
 
-    This agent provides a starter project for special purpose QA agents that can answer questions about documents
-    you provide.
-    """
+```
+Thought: Do I need to use a tool? Yes
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+```
 
-    indexer_mixin: IndexerPipelineMixin
+Some Tools will return Observations in the format of `Block(<identifier>)`. `Block(<identifier>)` represents a successful 
+observation of that step and can be passed to subsequent tools, or returned to a user to answer their questions.
+`Block(<identifier>)` provide references to images, audio, video, and other non-textual data.
 
+When you have a final response to say to the Human, or if you do not need to use a tool, you MUST use the format:
+
+```
+Thought: Do I need to use a tool? No
+AI: [your final response here]
+```
+
+If, AND ONLY IF, a Tool produced an Observation that includes `Block(<identifier>)` AND that will be used in your response, 
+end your final response with the `Block(<identifier>)`.
+
+Example:
+
+```
+Thought: Do I need to use a tool? Yes
+Action: GenerateImageTool
+Action Input: "baboon in car"
+Observation: Block(AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAAA)
+Thought: Do I need to use a tool? No
+AI: Here's that image you requested: Block(AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAAA)
+```
+
+Make sure to use all observations to come up with your final response.
+
+Begin!
+
+New input: {input}
+{scratchpad}"""
+
+
+#TelegramTransport config
+class TelegramTransportConfig(Config):
+    bot_token: str = Field(description="The secret token for your Telegram bot")
+    api_base: str = Field("https://api.telegram.org/bot", description="The root API for Telegram")
+
+
+class MyAssistant(AgentService):
+    
+    # supports telegram bot usage
+    config: TelegramTransportConfig
+
+    @classmethod
+    def config_cls(cls) -> Type[Config]:
+        """Return the Configuration class."""
+        return TelegramTransportConfig
+           
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        # This Mixin provides HTTP endpoints that coordinate the learning of documents.
-        #
-        # It adds the `/learn_url` endpoint which will:
-        #    1) Download the provided URL (PDF, YouTube URL, etc)
-        #    2) Convert that URL into text
-        #    3) Store the text in a vector index
-        #
-        # That vector index is then available to the question answering tool, below.
-        self.indexer_mixin = IndexerPipelineMixin(self.client, self)
-        self.add_mixin(self.indexer_mixin, permit_overwrite_of_existing_methods=True)
-
-        # A ReACTAgent is an agent that is able to:
-        #    1) Converse with you, casually... but also
-        #    2) Use tools that have been provided to it, such as QA tools or Image Generation tools
-        #
-        # This particular ReACTAgent has been provided with a single tool which will be used whenever
-        # the user answers a question. But you can extend this with more tools if you wish. For example,
-        # you could add tools to generate images, or search Google, or register an account.
-        self._agent = ReACTAgentThatAlwaysUsesToolOutput(
-            tools=[
-                VectorSearchQATool(
-                    agent_description=(
-                        "Used to answer questions. "
-                        "Whenever the input is a question, ALWAYS use this tool. "
-                        "The input is the question. "
-                        "The output is the answer. "
+        self._agent = ReACTAgent(tools=[
+            # tools it can use to answer the user's query
+                SearchTool(),
+                StableDiffusionTool(),
+                SummarizeTextWithPromptTool(),
+                TextTranslationTool(),
+                TextRewritingTool(),
+                VectorSearchLearnerTool(
+                    name="UserPreferences",
+                    index_handle="user-preference-index",
+                    agent_description= (
+                        "Used to remember the user's preference. Use this tool every time the user expresses a like, dislike, or preference. " 
+                        "Use this tool even if the user did not mention they want something remembered. "
+                        "The input is the user's preference to learn. "
+                        "The output is a confirmation of the personal preference that will be remembered."
                     )
                 )
             ],
-            llm=OpenAI(self.client),
+            llm=OpenAI(self.client,model_name="gpt-4"),
         )
+        self._agent.PROMPT = SYSTEM_PROMPT
 
-        # This Mixin provides HTTP endpoints that
-        self.add_mixin(
-            SteamshipWidgetTransport(
-                client=self.client, agent_service=self, agent=self._agent
-            )
-        )
+        #add Steamship widget chat mixin
+        self.widget_mixin = SteamshipWidgetTransport(self.client,self,self._agent)
+        self.add_mixin(self.widget_mixin,permit_overwrite_of_existing_methods=True)
+        #add Telegram chat mixin 
+        self.telegram_mixin = TelegramTransport(self.client,self.config,self,self._agent)
+        self.add_mixin(self.telegram_mixin,permit_overwrite_of_existing_methods=True)
+        #IndexerMixin
+        self.indexer_mixin = IndexerPipelineMixin(self.client,self)
+        self.add_mixin(self.indexer_mixin,permit_overwrite_of_existing_methods=True)
 
-    @post("/index_url")
-    def index_url(
-        self,
-        url: Optional[str] = None,
-        metadata: Optional[dict] = None,
-        index_handle: Optional[str] = None,
-        mime_type: Optional[str] = None,
-    ) -> Task:
-        return self.indexer_mixin.index_url(
-            url=url, metadata=metadata, index_handle=index_handle, mime_type=mime_type
-        )
 
     @post("prompt")
     def prompt(self, prompt: str) -> str:
@@ -144,7 +189,8 @@ class ExampleDocumentQAService(AgentService):
 
 
 if __name__ == "__main__":
-    # AgentREPL provides a mechanism for local execution of an AgentService method.
-    # This is used for simplified debugging as agents and tools are developed and
-    # added.
-    AgentREPL(ExampleDocumentQAService, "prompt", agent_package_config={}).run()
+    AgentREPL(
+        MyAssistant,
+        method="prompt",
+        agent_package_config={"botToken": "not-a-real-token-for-local-testing"},
+    ).run()
